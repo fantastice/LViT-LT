@@ -59,7 +59,7 @@ from torch import Tensor
 from timm.models._builder import build_model_with_cfg
 from timm.models._manipulate import named_apply, checkpoint_seq, adapt_input_conv
 from timm.models._pretrained import generate_default_cfgs
-# from timm.models._pretrained import DefaultCfg #自己改的
+# from timm.models._pretrained import DefaultCfg
 from timm.models._registry import register_model
 from xformers.ops import memory_efficient_attention, unbind, fmha
 
@@ -69,7 +69,125 @@ __all__ = ["VisionTransformer"]  # model_registry will add each entrypoint fn to
 
 _logger = logging.getLogger(__name__)
 
-#自注意力机制,主要功能是计算输入序列中每个位置的加权表示，考虑到其他位置的信息。
+class h_sigmoid(nn.Module):
+    def __init__(self, inplace=True):
+        super(h_sigmoid, self).__init__()
+        self.relu = nn.ReLU6(inplace=inplace)
+
+    def forward(self, x):
+        return self.relu(x + 3) / 6
+
+
+class h_swish(nn.Module):
+    def __init__(self, inplace=True):
+        super(h_swish, self).__init__()
+        self.sigmoid = h_sigmoid(inplace=inplace)
+
+    def forward(self, x):
+        return x * self.sigmoid(x)
+
+
+class ECALayer(nn.Module):
+    def __init__(self, channel, gamma=2, b=1, sigmoid=True):
+        super(ECALayer, self).__init__()
+        t = int(abs((math.log(channel, 2) + b) / gamma))
+        k = t if t % 2 else t + 1
+
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.conv = nn.Conv1d(1, 1, kernel_size=k, padding=k // 2, bias=False)
+        if sigmoid:
+            self.sigmoid = nn.Sigmoid()
+        else:
+            self.sigmoid = h_sigmoid()
+
+    def forward(self, x):
+        y = self.avg_pool(x)
+        y = self.conv(y.squeeze(-1).transpose(-1, -2))
+        y = y.transpose(-1, -2).unsqueeze(-1)
+        y = self.sigmoid(y)
+        return x * y.expand_as(x)
+
+
+class SELayer(nn.Module):
+    def __init__(self, channel, reduction=4):
+        super(SELayer, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+                nn.Linear(channel, channel // reduction),
+                nn.ReLU(inplace=True),
+                nn.Linear(channel // reduction, channel),
+                h_sigmoid()
+        )
+
+    def forward(self, x):
+        b, c, _, _ = x.size()
+        y = self.avg_pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1, 1)
+        return x * y
+
+
+class LocalityFeedForward(nn.Module):
+    def __init__(self, in_dim, out_dim, stride, expand_ratio=4., act='hs+se', reduction=4,
+                 wo_dp_conv=False, dp_first=False):
+        """
+        :param in_dim: the input dimension
+        :param out_dim: the output dimension. The input and output dimension should be the same.
+        :param stride: stride of the depth-wise convolution.
+        :param expand_ratio: expansion ratio of the hidden dimension.
+        :param act: the activation function.
+                    relu: ReLU
+                    hs: h_swish
+                    hs+se: h_swish and SE module
+                    hs+eca: h_swish and ECA module
+                    hs+ecah: h_swish and ECA module. Compared with eca, h_sigmoid is used.
+        :param reduction: reduction rate in SE module.
+        :param wo_dp_conv: without depth-wise convolution.
+        :param dp_first: place depth-wise convolution as the first layer.
+        """
+        super(LocalityFeedForward, self).__init__()
+        hidden_dim = int(in_dim * expand_ratio)
+        kernel_size = 3
+
+        layers = []
+        # the first linear layer is replaced by 1x1 convolution.
+        layers.extend([
+            nn.Conv2d(in_dim, hidden_dim, 1, 1, 0, bias=False),
+            nn.BatchNorm2d(hidden_dim),
+            h_swish() if act.find('hs') >= 0 else nn.ReLU6(inplace=True)])
+
+        # the depth-wise convolution between the two linear layers
+        if not wo_dp_conv:
+            dp = [
+                nn.Conv2d(hidden_dim, hidden_dim, kernel_size, stride, kernel_size // 2, groups=hidden_dim, bias=False),
+                nn.BatchNorm2d(hidden_dim),
+                h_swish() if act.find('hs') >= 0 else nn.ReLU6(inplace=True)
+            ]
+            if dp_first:
+                layers = dp + layers
+            else:
+                layers.extend(dp)
+
+        if act.find('+') >= 0:
+            attn = act.split('+')[1]
+            if attn == 'se':
+                layers.append(SELayer(hidden_dim, reduction=reduction))
+            elif attn.find('eca') >= 0:
+                layers.append(ECALayer(hidden_dim, sigmoid=attn == 'eca'))
+            else:
+                raise NotImplementedError('Activation type {} is not implemented'.format(act))
+
+        # the second linear layer is replaced by 1x1 convolution.
+        layers.extend([
+            nn.Conv2d(hidden_dim, out_dim, 1, 1, 0, bias=False),
+            nn.BatchNorm2d(out_dim)
+        ])
+        self.conv = nn.Sequential(*layers)
+
+    def forward(self, x):
+        x = x + self.conv(x)
+        return x
+
+#
 class Attention(nn.Module):
     def __init__(
         self,
@@ -129,8 +247,7 @@ class Attention(nn.Module):
         # return x, q, k, v, attn, q[:, :, 64:128]
         return x, q, k, v, attn, q[:, 1]
 
-#MemEffAttentionAttention。
-# 在 forward 方法中，输入的张量 x 被拆分成查询（q）、键（k）和值（v）三个部分，使用内存高效的注意力机制进行计算。最终输出经过线性投影和丢弃层，返回处理后的张量。
+#MemEffAttentionAttention
 class MemEffAttention(Attention):
     def forward(self, x: Tensor, attn_bias=None) -> Tensor:
         # if not XFORMERS_AVAILABLE:
@@ -149,7 +266,7 @@ class MemEffAttention(Attention):
         x = self.proj_drop(x)
         return x
 
-#使用一个可学习的参数 gamma 对输入进行缩放，支持就地操作
+#
 class LayerScale(nn.Module):
     def __init__(self, dim, init_values=1e-5, inplace=False):
         super().__init__()
@@ -159,7 +276,7 @@ class LayerScale(nn.Module):
     def forward(self, x):
         return x.mul_(self.gamma) if self.inplace else x * self.gamma
 
-#这个 Block 类结合了自注意力机制和前馈神经网络，同时引入了层归一化和随机深度的概念，以提高训练的稳定性和效率。
+#
 
 class Block(nn.Module):
     def __init__(
@@ -168,18 +285,19 @@ class Block(nn.Module):
         num_heads,
         mlp_ratio=4.0,
         qkv_bias=False,
-        qk_scale=None,#add in 11.15
+        # qk_scale=None,#add in 11.15
         drop=0.0,
         attn_drop=0.0,
         init_values=None,
         drop_path=0.0,
-        act_layer=nn.GELU, #激活函数，默认为 GELU
-        norm_layer=nn.LayerNorm, #正则化层，默认为 LayerNorm。
+        act_layer=nn.GELU, #GELU
+        norm_layer=nn.LayerNorm, #LayerNorm
         mask_attn=False,
         early_stopping=False,
+        act='hs+se', reduction=4, wo_dp_conv=False, dp_first=False
     ):
         super().__init__()
-        #norm1，norm2对输入进行层归一化。
+        #norm1
         self.norm1 = norm_layer(dim)
         # self.attn = Attention(
         #     dim,
@@ -190,12 +308,12 @@ class Block(nn.Module):
         #     mask_attn=mask_attn,
         #     early_stopping=early_stopping,
         # )
-        #自注意力机制，使用 MemEffAttention
+        # MemEffAttention
         self.attn = MemEffAttention(
             dim,
             num_heads=num_heads,
             qkv_bias=qkv_bias,
-            qk_scale=qk_scale,#add in 11.15
+            # qk_scale=qk_scale,#add in 11.15
             attn_drop=attn_drop,
             proj_drop=drop,
         )
@@ -206,22 +324,38 @@ class Block(nn.Module):
         self.drop_path1 = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
 
         self.norm2 = norm_layer(dim)
-        self.mlp = Mlp(
-            in_features=dim,
-            hidden_features=int(dim * mlp_ratio),
-            act_layer=act_layer,
-            drop=drop,
-        )
+        #1
+        # self.mlp = Mlp(
+        #     in_features=dim,
+        #     hidden_features=int(dim * mlp_ratio),
+        #     act_layer=act_layer,
+        #     drop=drop,
+        # )
+        self.conv=LocalityFeedForward(dim, dim, 1, mlp_ratio, act, reduction, wo_dp_conv, dp_first)
+
         self.ls2 = (
             LayerScale(dim, init_values=init_values) if init_values else nn.Identity()
         )
         self.drop_path2 = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
 
     def forward(self, x, give_attention=False):
+        batch_size, num_token, embed_dim = x.shape
+        patch_token_count = num_token - 2
+        patch_size = int(math.sqrt(patch_token_count))
         if give_attention:
             x_attn, q, k, v, attn, q_dist = self.attn(self.norm1(x))
             x = x + self.drop_path1(self.ls1(x_attn))
-            x = x + self.drop_path2(self.ls2(self.mlp(self.norm2(x))))
+            x=self.norm2(x)
+            # Split the class token and the image token.
+            # cls_token, x = torch.split(x, [1, patch_token_count], dim=1)  # (B, 1, dim), (B, 196, dim)
+            # Reshape and update the image token.
+            # print(f"batch_size: {batch_size}, num_token: {num_token}, embed_dim: {embed_dim}, patch_token_count: {patch_token_count}, patch_size: {patch_size}")
+            cls_token, dist_token,x = torch.split(x, [1,1, patch_token_count], dim=1)  # (B, 1, dim), (B, 196, dim)
+            x = x.transpose(1, 2).view(batch_size, embed_dim, patch_size, patch_size)  # (B, dim, 14, 14)
+            x = self.conv(x).flatten(2).transpose(1, 2)  # (B, 196, dim)
+            # Concatenate the class token and the newly computed image token.
+            x = torch.cat([cls_token, dist_token,x], dim=1)
+            x = x + self.drop_path2(self.ls2(x))
             return x, attn, q_dist
 
         # Attention block returns x, q_dist, separate them at input
@@ -230,7 +364,17 @@ class Block(nn.Module):
         # y, q, k, v, attn, q_dist = self.attn(self.norm1(x))
         y = self.attn(self.norm1(x))
         x = x + self.drop_path1(self.ls1(y))
-        x = x + self.drop_path2(self.ls2(self.mlp(self.norm2(x))))
+        x=self.norm2(x)
+        # Split the class token and the image token.
+        # cls_token, x = torch.split(x, [1, patch_token_count], dim=1)  # (B, 1, dim), (B, 196, dim)
+        # Reshape and update the image token.
+        # print(f"batch_size: {batch_size}, num_token: {num_token}, embed_dim: {embed_dim}, patch_token_count: {patch_token_count}, patch_size: {patch_size}")
+        cls_token, dist_token,x = torch.split(x, [1,1, patch_token_count], dim=1)  # (B, 1, dim), (B, 196, dim)
+        x = x.transpose(1, 2).view(batch_size, embed_dim, patch_size, patch_size)  # (B, dim, 14, 14)
+        x = self.conv(x).flatten(2).transpose(1, 2)  # (B, 196, dim)
+        # Concatenate the class token and the newly computed image token.
+        x = torch.cat([cls_token,dist_token, x], dim=1)
+        x = x + self.drop_path2(self.ls2(x))
         return x
         # return x, q_dist
 
@@ -248,6 +392,7 @@ class ResPostBlock(nn.Module):
         drop_path=0.0,
         act_layer=nn.GELU,
         norm_layer=nn.LayerNorm,
+        act='hs+se', reduction=4, wo_dp_conv=False, dp_first=False
     ):
         super().__init__()
         self.init_values = init_values
@@ -261,18 +406,19 @@ class ResPostBlock(nn.Module):
         )
         self.norm1 = norm_layer(dim)
         self.drop_path1 = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+        #2
+        # self.mlp = Mlp(
+        #     in_features=dim,
+        #     hidden_features=int(dim * mlp_ratio),
+        #     act_layer=act_layer,
+        #     drop=drop,
+        # )
+        self.conv = LocalityFeedForward(dim, dim, 1, mlp_ratio, act, reduction, wo_dp_conv, dp_first)
 
-        self.mlp = Mlp(
-            in_features=dim,
-            hidden_features=int(dim * mlp_ratio),
-            act_layer=act_layer,
-            drop=drop,
-        )
         self.norm2 = norm_layer(dim)
         self.drop_path2 = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
 
-        self.init_weights()#初始化 norm1 和 norm2 的权重
-
+        self.init_weights()# norm2
     def init_weights(self):
         # NOTE this init overrides that base model init with specific changes for the block type
         if self.init_values is not None:
@@ -280,11 +426,21 @@ class ResPostBlock(nn.Module):
             nn.init.constant_(self.norm2.weight, self.init_values)
 
     def forward(self, x):
+        batch_size, num_token, embed_dim = x.shape  # (B, 197, dim)
+        patch_token_count=num_token - 2
+        patch_size = int(math.sqrt(patch_token_count))
         x = x + self.drop_path1(self.norm1(self.attn(x)))
-        x = x + self.drop_path2(self.norm2(self.mlp(x)))
+        # Split the class token and the image token.
+        cls_token, dist_token,x = torch.split(x, [1,1, patch_token_count], dim=1)  # (B, 1, dim), (B, 196, dim)
+        # Reshape and update the image token.
+        x = x.transpose(1, 2).view(batch_size, embed_dim, patch_size, patch_size)  # (B, dim, 14, 14)
+        x = self.conv(x).flatten(2).transpose(1, 2)  # (B, 196, dim)
+        # Concatenate the class token and the newly computed image token.
+        x = torch.cat([cls_token, dist_token,x], dim=1)
+        x = x + self.drop_path2(self.norm2(x))
         return x
 
-#实现多个并行的自注意力机制和前馈网络
+#
 class ParallelBlock(nn.Module):
     def __init__(
         self,
@@ -299,10 +455,11 @@ class ParallelBlock(nn.Module):
         drop_path=0.0,
         act_layer=nn.GELU,
         norm_layer=nn.LayerNorm,
+        act='hs+se', reduction=4, wo_dp_conv=False, dp_first=False
     ):
         super().__init__()
-        self.num_parallel = num_parallel#存储并行模块的数量
-        # 分别存储并行的注意力模块和前馈网络，使用 nn.ModuleList 来管理多个模块实例。
+        self.num_parallel = num_parallel#
+        #
         self.attns = nn.ModuleList()
         self.ffns = nn.ModuleList()
         for _ in range(num_parallel):
@@ -344,12 +501,16 @@ class ParallelBlock(nn.Module):
                             ("norm", norm_layer(dim)),
                             (
                                 "mlp",
-                                Mlp(
-                                    dim,
-                                    hidden_features=int(dim * mlp_ratio),
-                                    act_layer=act_layer,
-                                    drop=drop,
-                                ),
+                                #3
+                            #Mlp(
+                            #     dim,
+                            #     int(dim * mlp_ratio),
+                            #     act_layer,
+                            #     drop,
+                            # )
+                                LocalityFeedForward(dim, dim, 1, mlp_ratio,
+                                                    act, reduction, wo_dp_conv, dp_first
+                                                    ),
                             ),
                             (
                                 "ls",
@@ -367,17 +528,41 @@ class ParallelBlock(nn.Module):
                     )
                 )
             )
-    #使用 torch.stack 来计算所有注意力和前馈网络的输出，然后将它们求和并进行残差连接。
+    #
     def _forward_jit(self, x):
+        batch_size, num_token, embed_dim = x.shape  # (B, 197, dim)
+        patch_token_count = num_token - 2
+        patch_size = int(math.sqrt(patch_token_count))
+
         x = x + torch.stack([attn(x) for attn in self.attns]).sum(dim=0)
-        x = x + torch.stack([ffn(x) for ffn in self.ffns]).sum(dim=0)
+
+        # Split the class token and the image token.
+        # cls_token, x = torch.split(x, [1, patch_token_count], dim=1)  # (B, 1, dim), (B, 196, dim)
+        # Reshape and update the image token.
+        cls_token, dist_token,x = torch.split(x, [1,1, patch_token_count], dim=1)  # (B, 1, dim), (B, 196, dim)
+        x = x.transpose(1, 2).view(batch_size, embed_dim, patch_size, patch_size)  # (B, dim, 14, 14)
+        # x = self.ffn(x).flatten(2).transpose(1, 2)  # (B, 196, dim)
+        # Concatenate the class token and the newly computed image token.
+        x = x + torch.stack([ffn(x).flatten(2).transpose(1, 2) for ffn in self.ffns]).sum(dim=0)
+        x = torch.cat([cls_token,dist_token, x], dim=1)
         return x
 
     @torch.jit.ignore
-    #直接计算并行模块的输出并进行残差连接
+    #
     def _forward(self, x):
+        batch_size, num_token, embed_dim = x.shape  # (B, 197, dim)
+        patch_token_count = num_token - 1
+        patch_size = int(math.sqrt(patch_token_count))
+
         x = x + sum(attn(x) for attn in self.attns)
-        x = x + sum(ffn(x) for ffn in self.ffns)
+        # Split the class token and the image token.
+        cls_token, x = torch.split(x, [1, patch_token_count], dim=1)  # (B, 1, dim), (B, 196, dim)
+        # Reshape and update the image token.
+        x = x.transpose(1, 2).view(batch_size, embed_dim, patch_size, patch_size)  # (B, dim, 14, 14)
+        # x = self.ffn(x).flatten(2).transpose(1, 2)  # (B, 196, dim)
+        # Concatenate the class token and the newly computed image token.
+        x = x + sum(ffn(x).flatten(2).transpose(1, 2) for ffn in self.ffns)
+        x = torch.cat([cls_token, x], dim=1)
         return x
 
     def forward(self, x):
@@ -386,7 +571,7 @@ class ParallelBlock(nn.Module):
         else:
             return self._forward(x)
 
-#通过卷积操作将输入图像分割为小的补丁，并将这些补丁映射到指定的嵌入空间。
+#
 class PatchEmbedCustom(nn.Module):
     """Image to Patch Embedding"""
 
@@ -406,7 +591,7 @@ class PatchEmbedCustom(nn.Module):
         x = self.proj(x).flatten(2).transpose(1, 2)
         return x
 
-#将图像数据输入 Transformer 结构进行分类
+#
 class VisionTransformer(nn.Module):
     """Vision Transformer
 
@@ -420,11 +605,11 @@ class VisionTransformer(nn.Module):
         patch_size=16,
         in_chans=3,
         num_classes=1000,
-        global_pool="token",#指定全局池化的方式
-        embed_dim=768,#嵌入的维度
-        depth=12,#Transformer 中的块数
-        num_heads=12,#注意力头的数量
-        mlp_ratio=4.0,#前馈网络隐藏层维度与嵌入维度的比率
+        global_pool="token",#
+        embed_dim=768,#
+        depth=12,#Transformer
+        num_heads=12,#
+        mlp_ratio=4.0,#
         qkv_bias=True,
         init_values=None,
         class_token=True,
@@ -535,7 +720,7 @@ class VisionTransformer(nn.Module):
 
         if weight_init != "skip":
             self.init_weights(weight_init)
-    #初始化模型的权重，支持多种初始化方案，并确保类标记和位置嵌入的标准差设置正确。
+    #
     def init_weights(self, mode=""):
         assert mode in ("jax", "jax_nlhb", "moco", "")
         head_bias = -math.log(self.num_classes) if "nlhb" in mode else 0.0
@@ -581,7 +766,7 @@ class VisionTransformer(nn.Module):
             dim=1,
         )
 
-    # 对位置嵌入进行插值，以适应不同尺寸的输入图像，确保模型在处理不同大小的图像时能正确地使用位置嵌入
+    #
     def interpolate_pos_encoding(self, x, w, h):
         # (n, patches, patch_dim)
         # (n, 197, 768)
@@ -668,7 +853,7 @@ class VisionTransformer(nn.Module):
             x = x + self.interpolate_pos_encoding_plain(x, w, h)
             # x = x + self.pos_embed
         return self.pos_drop(x)
-    #处理输入图像，通过补丁嵌入、位置嵌入、预归一化和 Transformer 块，得到特征表示。
+    # Transformer
     def forward_features(self, x):
         B, nc, w, h = x.shape
         x = self.patch_embed(x)
@@ -682,7 +867,7 @@ class VisionTransformer(nn.Module):
             x = self.blocks(x)
         x = self.norm(x)
         return x
-    #根据全局池化的策略（平均池化或选择类标记）处理特征，并通过全连接层输出最终结果。
+    #
     def forward_head(self, x, pre_logits: bool = False):
         if self.global_pool:
             x = (
@@ -692,7 +877,7 @@ class VisionTransformer(nn.Module):
             )
         x = self.fc_norm(x)
         return x if pre_logits else self.head(x)
-    #综合 forward_features 和 forward_head 方法，完成从输入图像到最终分类输出的整个流程。
+    #forward_features  forward_head
     def forward(self, x):
         x = self.forward_features(x)
         x = self.forward_head(x)
