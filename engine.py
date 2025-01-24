@@ -38,9 +38,8 @@ def train_one_epoch(
     set_training_mode=True,
     args=None,
 ):
-    #设置模型为训练模式，启用 dropout 和 batch normalization。
     model.train(set_training_mode)
-    #初始化用于记录训练过程中的各种指标，比如学习率。
+
     metric_logger = utils.MetricLogger(delimiter="  ")
     metric_logger.add_meter("lr", utils.SmoothedValue(window_size=1, fmt="{value:.6f}"))
     header = "Epoch: [{}]".format(epoch)
@@ -48,13 +47,13 @@ def train_one_epoch(
 
     no_mixup_drw_flag = True
     accum_iter = args.accum_iter
-    #遍历数据加载器中的每一个批次，获取学生模型的输入样本和目标标签。
+
     for data_iter_step, (samples_student, targets) in enumerate(
         metric_logger.log_every(
             iterable=data_loader, print_freq=print_freq, header=header
         )
     ):
-        #如果使用多裁剪技术，将样本和标签合并并移动到设备上
+
         if args.multi_crop:
             samples_student_global = torch.cat(samples_student[:2], dim=0)
             samples_student_local = torch.cat(samples_student[2:], dim=0)
@@ -79,7 +78,7 @@ def train_one_epoch(
             data_iter_step % accum_iter == 0 or data_iter_step == (len(data_loader) - 1)
         ):
             lr_scheduler.step(epoch + data_iter_step / len(data_loader))
-        if mixup_fn is not None and epoch < drw:  # do mixup before starting drw only在训练开始前和 DRW 阶段，根据是否使用 Mixup 进行数据增强。
+        if mixup_fn is not None and epoch < drw:  # do mixup before starting drw only
             if args.student_transform == 0:
                 # --> Mixup for local and global crops
                 if args.multi_crop:
@@ -136,7 +135,7 @@ def train_one_epoch(
                 samples_student = samples_student.to(device)
                 targets_student = targets.to(device)
 
-        if args.bce_loss:#如果使用二元交叉熵损失，对目标标签进行相应的处理。
+        if args.bce_loss:
             if epoch >= drw:
                 targets_student = torch.nn.functional.one_hot(
                     targets_student.to(torch.int64), num_classes=args.nb_classes
@@ -145,7 +144,7 @@ def train_one_epoch(
                 targets_student = targets_student.gt(0.0).type(targets_student.dtype)
 
         # --> setting teacher samples (pass only global crop)
-        if args.input_size != args.teacher_size and not args.no_distillation:#根据教师模型的输入尺寸，调整样本的尺寸。
+        if args.input_size != args.teacher_size and not args.no_distillation:
             if args.multi_crop:
                 samples_teacher = transforms.Compose(
                     [transforms.Resize(args.teacher_size, interpolation=3)]
@@ -162,7 +161,7 @@ def train_one_epoch(
                 samples_teacher = samples_student
 
         with torch.cuda.amp.autocast():
-            # --> Multi-crop forward pass进行前向传播，并根据是否使用知识蒸馏处理不同的样本。
+            # --> Multi-crop forward pass
             if args.multi_crop and not args.no_distillation:
                 out_student_local = model(samples_student_local)
                 out_student_global = model(samples_student_global)
@@ -191,7 +190,7 @@ def train_one_epoch(
                 outputs_student = model(samples_student)
                 _, _, sim_12, adl = outputs_student
 
-            if not args.no_distillation:#根据是否使用知识蒸馏计算损失。
+            if not args.no_distillation:
                 sim_12 = torch.mean(sim_12)
                 loss, cls_loss, dst_loss = criterion(
                     samples_teacher, outputs_student, targets_student
@@ -216,7 +215,7 @@ def train_one_epoch(
             print("Loss is {}, stopping training".format(loss_value))
             sys.exit(1)
 
-        if accum_iter > 1: #进行梯度缩放和优化，处理大批量数据时的梯度累积。
+        if accum_iter > 1:
             loss /= accum_iter
 
         # this attribute is added by timm on one optimizer (adahessian)
@@ -267,7 +266,7 @@ def train_one_epoch(
 
     return train_stats
 
-#accuracy 函数计算给定输出和目标的准确率。topk 参数指定要计算的准确率的前 k 个分类。
+
 def accuracy(output, target, args, topk=(1,)):
     with torch.no_grad():
         maxk = max(topk)
@@ -286,7 +285,7 @@ def accuracy(output, target, args, topk=(1,)):
             res.append(correct_k.mul_(100.0 / batch_size))
         return res
 
-#evaluate 函数用于评估模型在测试数据上的表现。它计算了模型的准确率，并根据不同的类别划分了准确率
+
 @torch.no_grad()
 def evaluate(data_loader, model, device, args):
     metric_logger = utils.MetricLogger(delimiter="  ")
@@ -316,8 +315,7 @@ def evaluate(data_loader, model, device, args):
                 output_cls = outputs
                 output_dist = outputs
             else:
-                #自己加的
-                _,_,output_cls, output_dist = outputs
+                output_cls, output_dist = outputs
                 # output_cls = outputs
                 # output_dist = outputs
         # print(samples_student[0])
