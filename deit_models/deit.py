@@ -44,26 +44,24 @@ class DistilledVisionTransformer(VisionTransformer):
         trunc_normal_(self.dist_token, std=0.02)
         trunc_normal_(self.pos_embed, std=0.02)
         self.head_dist.apply(self._init_weights)
-    #准备模型输入的 tokens
+
     def prepare_tokens(self, x):
         # taken from https://github.com/rwightman/pytorch-image-models/blob/master/timm/models/vision_transformer.py
         # with slight modifications to add the dist_token
         B, nc, w, h = x.shape
         x = self.patch_embed(x)
-        #用于分类的 token，扩展到当前 batch size
+
         cls_tokens = self.cls_token.expand(
             B, -1, -1
         )  # stole cls_tokens impl from Phil Wang, thanks
-        #用于蒸馏的 token，也扩展到 batch size
         dist_token = self.dist_token.expand(B, -1, -1)
-        #将分类 token、蒸馏 token 和所有 patches 的嵌入拼接在一起。
         x = torch.cat((cls_tokens, dist_token, x), dim=1)
 
         # --> New pos encoding
         x = x + self.interpolate_pos_encoding(x, w, h)
         x = self.pos_drop(x)
         return x
-    #计算模型的特征输出。
+
     def forward_features(self, x):
         # x = [self.prepare_tokens(x) for x in x_list]
         x = self.prepare_tokens(x)
@@ -72,24 +70,19 @@ class DistilledVisionTransformer(VisionTransformer):
             x = self.blocks[i](x)
 
         x = self.norm(x)
-
-        #返回分类 token 和蒸馏 token（分别对应 x[:, 0] 和 x[:, 1]）
         return x[:, 0], x[:, 1]
 
     def forward(self, x):
-        features,x, x_dist = self.forward_features(x)
+        x, x_dist = self.forward_features(x)
 
         cls_token = x
         distill_token = x_dist
-        features = x_dist  # 自己加的
 
         cos = nn.CosineSimilarity(dim=1, eps=1e-6)
 
         sim_12 = cos(cls_token, distill_token)
         x = self.head(x)
         x_dist = self.head_dist(x_dist)
-        #自己加的
-        output= x_dist
 
         # --> Attention Diversification loss
         # Thresholding from ADL --> top-k for our use-case
@@ -119,7 +112,7 @@ class DistilledVisionTransformer(VisionTransformer):
         if self.training:
             return x, x_dist, sim_12, adl_loss  # (batch, 10)
         else:
-            return features,output,x, x_dist
+            return x, x_dist
 
     def copy_dist_qkv(self):
         for i in range(len(self.blocks)):
